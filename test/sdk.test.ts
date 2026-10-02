@@ -22,6 +22,16 @@ class Fake {
   inflight = 0;
   maxInflight = 0;
   requests = 0;
+  public = new Map<string, { prefix: string; list?: boolean }[]>(); // bucket: what anyone may read
+}
+
+/** An unsigned GET or HEAD of an object a bucket made public. */
+function publicRead(fake: Fake, req: IncomingMessage): boolean {
+  if (req.headers.authorization || (req.method !== 'GET' && req.method !== 'HEAD')) return false;
+  const [bucket = '', kind = '', ...rest] = new URL(req.url!, 'http://x').pathname.slice('/v1/buckets/'.length).split('/');
+  if (kind !== 'objects' || !rest.length) return false;
+  const key = decodeURIComponent(rest.join('/'));
+  return (fake.public.get(bucket) ?? []).some((r) => key.startsWith(r.prefix));
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -44,7 +54,7 @@ function startFake(fake: Fake): Promise<{ server: Server; url: string }> {
     fake.maxInflight = Math.max(fake.maxInflight, ++fake.inflight);
     res.on('close', () => fake.inflight--);
     let body = await readBody(req);
-    if (req.headers.authorization !== 'Bearer KEY:SECRET') return fail(res, 401, 'unauthorized');
+    if (req.headers.authorization !== 'Bearer KEY:SECRET' && !publicRead(fake, req)) return fail(res, 401, 'unauthorized');
     if (fake.flaky > 0) {
       fake.flaky--;
       return fail(res, 503, 'busy');
@@ -99,6 +109,10 @@ function startFake(fake: Fake): Promise<{ server: Server; url: string }> {
       }
       out.objects = keys.map((k) => ({ key: k, size: fake.objects.get(`${bucket}/${k}`)!.length }));
       return send(res, 200, out);
+    }
+    if (kind === 'public') {
+      if (req.method === 'PUT') fake.public.set(bucket, JSON.parse(body.toString()).rules);
+      return send(res, 200, { rules: fake.public.get(bucket) ?? [] });
     }
     if (kind === 'uploads') {
       if (!rest) {
@@ -221,6 +235,21 @@ describe('against a fake service', () => {
     const keys: string[] = [];
     for await (const o of client.bucket('b').objects('p/', { pageSize: 10 })) keys.push(o.key);
     assert.deepEqual(keys, Array.from({ length: 25 }, (_, i) => `p/${String(i).padStart(2, '0')}`));
+  });
+
+  test('public access', async () => {
+    const b = client.bucket('site');
+    await b.put('public/a b.txt', 'hello');
+    await b.put('private/x.txt', 'secret');
+    assert.deepEqual(await b.setPublicAccess([{ prefix: 'public/' }]), [{ prefix: 'public/', list: false }]);
+    assert.deepEqual(await b.publicAccess(), [{ prefix: 'public/', list: false }]);
+    const base = new URL(b.publicUrl('x')).origin;
+    assert.equal(b.publicUrl('public/a b.txt'), `${base}/site/public/a%20b.txt`);
+    // Without a key the client reads what is public, nothing else.
+    const anon = new Client({ endpoint: base });
+    assert.equal(await anon.bucket('site').getText('public/a b.txt'), 'hello');
+    await assert.rejects(anon.bucket('site').getText('private/x.txt'));
+    assert.throws(() => new Client({ endpoint: base, accessKeyId: 'KEY' }));
   });
 
   test('range downloads', async () => {

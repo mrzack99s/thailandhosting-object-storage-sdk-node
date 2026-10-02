@@ -56,6 +56,23 @@ Create access keys in the Console (Object Storage → Access keys). Reuse one
 `Client`: it keeps connections open. Every call takes an optional
 `AbortSignal`.
 
+## Public buckets and folders
+
+```ts
+// Anyone may read images/ (and nothing else) without a key; needs a key
+// allowed to manage buckets. [] makes the bucket private again.
+await bucket.setPublicAccess([{ prefix: 'images/' }]);
+console.log(bucket.publicUrl('images/logo.png'));
+// https://objects.bkk.thailandhosting.com/my-bucket/images/logo.png
+
+// A client without a key reads (and, where allowed, lists) public objects.
+const anon = new Client({ endpoint: 'https://objects.bkk.thailandhosting.com' });
+const logo = await anon.bucket('my-bucket').getBytes('images/logo.png');
+```
+
+What a key may do (buckets, folders, read / list / write / delete,
+managing buckets, an expiry date) is set on the key in the Console.
+
 ## Performance
 
 | | |
@@ -92,6 +109,7 @@ Create access keys in the Console (Object Storage → Access keys). Reuse one
 | `head`, `exists`, `delete`, `deleteMany`, `copy` | object operations |
 | `list` (one page), `objects` (async iterator) | listing |
 | `createLink(key, { expiresIn, upload })` | a link that needs no key |
+| `publicAccess()`, `setPublicAccess(rules)`, `publicUrl(key)` | make the bucket or some folders readable by anyone, and their URLs |
 | `createMultipartUpload`, `resumeMultipartUpload` → `uploadPart`, `parts`, `complete`, `abort` | do-it-yourself multipart |
 
 Errors from the service are `ObjectStorageError` (`status`, `code`,

@@ -14,8 +14,9 @@ const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
 export interface ClientOptions {
   /** The region's endpoint, e.g. https://objects.bkk.thailandhosting.com */
   endpoint: string;
-  accessKeyId: string;
-  secretAccessKey: string;
+  /** With secretAccessKey; leave both out for an anonymous client that reads only what buckets made public. */
+  accessKeyId?: string;
+  secretAccessKey?: string;
   /** Size of each upload part and download range (default 16 MiB, at least 5 MiB). */
   partSize?: number;
   /** Size above which transfers are split (default 2 × partSize). */
@@ -34,6 +35,14 @@ export interface BucketInfo {
   name: string;
   region: string;
   createdAt?: Date;
+  /** What anyone may read; getBucket fills it, listBuckets does not. */
+  public?: PublicRule[];
+}
+
+/** Makes the objects under `prefix` ("" is the whole bucket) readable by anyone without a key; `list` also lets anyone list those keys. */
+export interface PublicRule {
+  prefix: string;
+  list?: boolean;
 }
 
 export interface ObjectInfo {
@@ -202,19 +211,21 @@ export class Client {
   readonly concurrency: number;
   readonly maxRetries: number;
   private readonly base: string;
+  /** @internal */ readonly origin: string;
   private readonly auth: string;
   private readonly ua: string;
   private readonly fetch: typeof fetch;
 
   constructor(opts: ClientOptions) {
-    if (!opts.endpoint || !opts.accessKeyId || !opts.secretAccessKey) {
-      throw new Error('endpoint, accessKeyId and secretAccessKey are required');
+    if (!opts.endpoint || !opts.accessKeyId !== !opts.secretAccessKey) {
+      throw new Error('endpoint is required, and accessKeyId and secretAccessKey together');
     }
     const u = new URL(opts.endpoint);
     if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error(`invalid endpoint ${opts.endpoint}`);
     const path = u.pathname.replace(/\/+$/, '').replace(/\/v1$/, '');
-    this.base = `${u.protocol}//${u.host}${path}/v1`;
-    this.auth = `Bearer ${opts.accessKeyId}:${opts.secretAccessKey}`;
+    this.origin = `${u.protocol}//${u.host}${path}`;
+    this.base = `${this.origin}/v1`;
+    this.auth = opts.accessKeyId ? `Bearer ${opts.accessKeyId}:${opts.secretAccessKey}` : '';
     this.partSize = Math.max(opts.partSize ?? 16 * MiB, MIN_PART_SIZE);
     this.multipartThreshold = opts.multipartThreshold ?? 2 * this.partSize;
     this.concurrency = Math.max(1, opts.concurrency ?? 8);
@@ -232,7 +243,8 @@ export class Client {
       const s = q.toString();
       if (s) url += '?' + s;
     }
-    const headers = { Authorization: this.auth, 'User-Agent': this.ua, ...r.headers };
+    const headers: Record<string, string> = { 'User-Agent': this.ua, ...r.headers };
+    if (this.auth) headers.Authorization = this.auth;
     for (let attempt = 0; ; attempt++) {
       let resp: Response;
       try {
@@ -281,7 +293,7 @@ export class Client {
   /** Create a bucket (3-63 characters of a-z, 0-9, dots and hyphens). */
   async createBucket(name: string, signal?: AbortSignal): Promise<BucketInfo> {
     const b = await this.json('PUT', '/buckets/' + encodeURIComponent(name), undefined, { signal });
-    return { name: b?.name ?? name, region: b?.region ?? '', createdAt: parseDate(b?.createdAt) };
+    return { name: b?.name ?? name, region: b?.region ?? '', createdAt: parseDate(b?.createdAt), public: b?.public };
   }
 
   async getBucket(name: string, signal?: AbortSignal): Promise<BucketInfo> {
@@ -446,6 +458,28 @@ export class Bucket {
   async createLink(key: string, opts: { expiresIn?: number; upload?: boolean; signal?: AbortSignal } = {}): Promise<Link> {
     const d = await this.c.json('POST', this.path + '/links', { key, expiresIn: opts.expiresIn ?? 3600, method: opts.upload ? 'PUT' : 'GET' }, { retryPost: true, signal: opts.signal });
     return { url: d.url, method: d.method, expiresAt: parseDate(d.expiresAt) };
+  }
+
+  /** What anyone may read in the bucket. */
+  async publicAccess(opts: { signal?: AbortSignal } = {}): Promise<PublicRule[]> {
+    const d = await this.c.json('GET', this.path + '/public', undefined, { signal: opts.signal });
+    return d.rules ?? [];
+  }
+
+  /**
+   * Replace what anyone may read: `[]` makes the bucket private, `[{ prefix: '' }]` opens all of it,
+   * `[{ prefix: 'images/' }]` one folder. Needs a key allowed to manage buckets; takes effect within
+   * about 15 seconds. Resolves to the rules as stored.
+   */
+  async setPublicAccess(rules: PublicRule[], opts: { signal?: AbortSignal } = {}): Promise<PublicRule[]> {
+    const payload = { rules: rules.map((r) => ({ prefix: r.prefix, list: !!r.list })) };
+    const d = await this.c.json('PUT', this.path + '/public', payload, { retryPost: true, signal: opts.signal });
+    return d.rules ?? [];
+  }
+
+  /** The address anyone can open `key` at once its folder (or the bucket) is public. No request is made. */
+  publicUrl(key: string): string {
+    return `${this.c.origin}/${encodeURIComponent(this.name)}/${escapeKey(key)}`;
   }
 
   /** Start a multipart upload (uploadFile and upload do this for you). */

@@ -14,5 +14,5 @@
  * ```
  */
 export { Client, Bucket, MultipartUpload, VERSION } from './client.ts';
-export type { BucketInfo, ClientOptions, GetOptions, Link, ListOptions, ListPage, ObjectDownload, ObjectInfo, Part, PutOptions } from './client.ts';
+export type { BucketInfo, ClientOptions, GetOptions, Link, ListOptions, ListPage, ObjectDownload, ObjectInfo, Part, PublicRule, PutOptions } from './client.ts';
 export { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError } from './errors.ts';
