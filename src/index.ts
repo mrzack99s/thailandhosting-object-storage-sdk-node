@@ -14,5 +14,10 @@
  * ```
  */
 export { Client, Bucket, MultipartUpload, VERSION } from './client.ts';
-export type { BucketInfo, ClientOptions, GetOptions, Link, ListOptions, ListPage, ObjectDownload, ObjectInfo, Part, PublicRule, PutOptions } from './client.ts';
-export { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError } from './errors.ts';
+export type {
+  BucketInfo, ClientOptions, CompleteOptions, DeleteOptions, GetOptions, HeadOptions, Link, ListOptions, ListPage, ObjectDownload, ObjectInfo, Part,
+  PublicRule, PutOptions, WriteConditions,
+} from './client.ts';
+export { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError } from './errors.ts';
+export { contentDigest, signRequest } from './signing.ts';
+export type { SignInput } from './signing.ts';

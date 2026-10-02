@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { open, mkdir, rename, rm, stat, type FileHandle } from 'node:fs/promises';
 import { dirname, extname } from 'node:path';
 import { Readable } from 'node:stream';
-import { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError } from './errors.ts';
+import { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError } from './errors.ts';
+import { contentDigest, sha256FromField, signRequest } from './signing.ts';
 
 export const VERSION = '1.0.0';
 
@@ -14,7 +15,8 @@ const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
 export interface ClientOptions {
   /** The region's endpoint, e.g. https://objects.bkk.thailandhosting.com */
   endpoint: string;
-  /** With secretAccessKey; leave both out for an anonymous client that reads only what buckets made public. */
+  /** With secretAccessKey; leave both out for an anonymous client that reads only what buckets made public.
+   *  Requests are signed with the secret (HTTP Message Signatures); the secret itself is never sent. */
   accessKeyId?: string;
   secretAccessKey?: string;
   /** Size of each upload part and download range (default 16 MiB, at least 5 MiB). */
@@ -52,28 +54,55 @@ export interface ObjectInfo {
   lastModified?: Date;
   contentType?: string;
   metadata: Record<string, string>;
+  /** The object's Repr-Digest (`sha-256=:<base64>:`), from get and head, when it was uploaded in
+   *  one request; full downloads are checked against it. Multipart uploads have none. */
+  digest?: string;
 }
 
-export interface PutOptions {
+/** Conditions checked by the service atomically with a write or delete; a false one throws
+ *  PreconditionFailedError. An ETag (quotes optional), a comma-separated list of them, or `*`. */
+export interface WriteConditions {
+  /** Only if the object's ETag is one of these (`*`: only if it exists). */
+  ifMatch?: string;
+  /** Only if the object's ETag is none of these (`*`: only if the key is free). */
+  ifNoneMatch?: string;
+}
+
+export interface PutOptions extends WriteConditions {
   contentType?: string;
   cacheControl?: string;
   contentDisposition?: string;
   contentEncoding?: string;
   /** Stored with the object, returned as X-Meta-<name> (2 KB in all). */
   metadata?: Record<string, string>;
-  /** Fail with code `precondition_failed` if the key already holds an object. */
+  /** Fail with code `precondition_failed` if the key already holds an object (`ifNoneMatch: '*'`). */
   ifNotExists?: boolean;
   signal?: AbortSignal;
 }
 
-export interface GetOptions {
+export interface HeadOptions {
+  /** Throw NotModifiedError when the object's ETag is one of these. */
+  ifNoneMatch?: string;
+  /** Throw PreconditionFailedError unless the object's ETag is one of these. */
+  ifMatch?: string;
+  /** Throw NotModifiedError unless the object changed after this. */
+  ifModifiedSince?: Date;
+  /** Throw PreconditionFailedError if the object changed after this. */
+  ifUnmodifiedSince?: Date;
+  signal?: AbortSignal;
+}
+
+export interface GetOptions extends HeadOptions {
   /** Download `length` bytes from `offset` (length omitted: to the end). */
   offset?: number;
   length?: number;
-  /** Throw NotModifiedError when the object's ETag is this one. */
-  ifNoneMatch?: string;
-  /** Fail with `precondition_failed` unless the object's ETag is this one. */
-  ifMatch?: string;
+}
+
+export interface DeleteOptions extends WriteConditions {
+  signal?: AbortSignal;
+}
+
+export interface CompleteOptions extends WriteConditions {
   signal?: AbortSignal;
 }
 
@@ -148,6 +177,54 @@ const backoff = (attempt: number) => {
   return d / 2 + Math.random() * (d / 2);
 };
 
+/** Retry-After (seconds or an HTTP date) in ms, at most 30 s; 0 when absent. */
+function retryAfter(v: string | null): number {
+  if (!v) return 0;
+  const ms = /^\d+$/.test(v.trim()) ? Number(v) * 1000 : Date.parse(v) - Date.now();
+  return ms > 0 ? Math.min(ms, 30_000) : 0;
+}
+
+/** An If-Match / If-None-Match value: `*`, or each ETag quoted. */
+const etagList = (v: string) => (v.trim() === '*' ? '*' : v.split(',').map((e) => `"${e.trim().replace(/^W\//, '').replace(/"/g, '')}"`).join(', '));
+
+function conditionHeaders(o: WriteConditions & { ifModifiedSince?: Date; ifUnmodifiedSince?: Date }, h: Record<string, string> = {}) {
+  if (o.ifMatch) h['If-Match'] = etagList(o.ifMatch);
+  if (o.ifNoneMatch) h['If-None-Match'] = etagList(o.ifNoneMatch);
+  if (o.ifModifiedSince) h['If-Modified-Since'] = o.ifModifiedSince.toUTCString();
+  if (o.ifUnmodifiedSince) h['If-Unmodified-Since'] = o.ifUnmodifiedSince.toUTCString();
+  return h;
+}
+
+/** Calls that took a bare signal take an options object too. */
+const optionsOf = <T extends { signal?: AbortSignal }>(v?: AbortSignal | T): T =>
+  (v === undefined ? {} : v instanceof AbortSignal ? { signal: v } : v) as T;
+
+/** The base64 SHA-256 a full download must have, when the service gave one for the bytes as sent. */
+function expectedDigest(h: Headers): string | undefined {
+  const enc = h.get('content-encoding');
+  // fetch decodes compressed bodies, so their bytes are not the representation's.
+  if (enc && enc.toLowerCase() !== 'identity') return undefined;
+  return sha256FromField(h.get('repr-digest'));
+}
+
+function checkDigest(want: string, got: string, key: string) {
+  if (want !== got) throw new IntegrityError(`${key}: the downloaded data does not match the object's Repr-Digest (sha-256 ${want}, got ${got})`);
+}
+
+/** Passes a body through, failing it at the end if its SHA-256 is not `want`. */
+function verifying(body: ReadableStream<Uint8Array>, want: string, key: string): ReadableStream<Uint8Array> {
+  const hash = createHash('sha256');
+  return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, ctrl) {
+      hash.update(chunk);
+      ctrl.enqueue(chunk);
+    },
+    flush() {
+      checkDigest(want, hash.digest('base64'), key);
+    },
+  }));
+}
+
 function checkETag(etag: string, digest: string, what: string) {
   const e = etag.replace(/"/g, '');
   if (e.length === 32 && !e.includes('-') && e !== digest) {
@@ -183,7 +260,10 @@ function objectFromHeaders(key: string, h: Headers): ObjectInfo {
   const size = cr && cr.includes('/') ? Number(cr.split('/')[1]) : Number(h.get('content-length') ?? 0);
   const metadata: Record<string, string> = {};
   h.forEach((v, k) => { if (k.startsWith('x-meta-')) metadata[k.slice(7)] = v; });
-  return { key, size, etag: (h.get('etag') ?? '').replace(/"/g, ''), lastModified: parseDate(h.get('last-modified')), contentType: h.get('content-type') ?? undefined, metadata };
+  return {
+    key, size, etag: (h.get('etag') ?? '').replace(/"/g, ''), lastModified: parseDate(h.get('last-modified')), contentType: h.get('content-type') ?? undefined, metadata,
+    digest: h.get('repr-digest') ?? undefined,
+  };
 }
 
 /** Runs task(0..n-1), `workers` at a time; the first failure stops new work and is thrown. */
@@ -212,7 +292,8 @@ export class Client {
   readonly maxRetries: number;
   private readonly base: string;
   /** @internal */ readonly origin: string;
-  private readonly auth: string;
+  private readonly keyId: string;
+  private readonly secret: string;
   private readonly ua: string;
   private readonly fetch: typeof fetch;
 
@@ -225,7 +306,8 @@ export class Client {
     const path = u.pathname.replace(/\/+$/, '').replace(/\/v1$/, '');
     this.origin = `${u.protocol}//${u.host}${path}`;
     this.base = `${this.origin}/v1`;
-    this.auth = opts.accessKeyId ? `Bearer ${opts.accessKeyId}:${opts.secretAccessKey}` : '';
+    this.keyId = opts.accessKeyId ?? '';
+    this.secret = opts.secretAccessKey ?? '';
     this.partSize = Math.max(opts.partSize ?? 16 * MiB, MIN_PART_SIZE);
     this.multipartThreshold = opts.multipartThreshold ?? 2 * this.partSize;
     this.concurrency = Math.max(1, opts.concurrency ?? 8);
@@ -244,8 +326,13 @@ export class Client {
       if (s) url += '?' + s;
     }
     const headers: Record<string, string> = { 'User-Agent': this.ua, ...r.headers };
-    if (this.auth) headers.Authorization = this.auth;
+    // Every body carries its digest; the service checks it as the bytes arrive.
+    if (r.body) headers['Content-Digest'] = contentDigest(r.body);
     for (let attempt = 0; ; attempt++) {
+      if (this.keyId) {
+        // A fresh signature each attempt: created must be close to the service's clock.
+        Object.assign(headers, signRequest({ method: r.method, url, accessKeyId: this.keyId, secretAccessKey: this.secret, contentDigest: headers['Content-Digest'] }));
+      }
       let resp: Response;
       try {
         resp = await this.fetch(url, { method: r.method, headers, body: r.body as BodyInit | undefined, signal: r.signal, redirect: 'manual' });
@@ -263,10 +350,8 @@ export class Client {
       const err = await readError(resp);
       const retryable = RETRY_STATUSES.has(resp.status) && (r.method !== 'POST' || (!!r.retryPost && (resp.status === 429 || resp.status === 503)));
       if (retryable && attempt < this.maxRetries) {
-        let wait = backoff(attempt);
-        const ra = Number(resp.headers.get('retry-after'));
-        if (ra > 0 && ra < 30) wait = Math.max(wait, ra * 1000);
-        await sleep(wait, r.signal);
+        // Retry-After (sent with 503) is the least the service wants us to wait.
+        await sleep(Math.max(backoff(attempt), retryAfter(resp.headers.get('retry-after'))), r.signal);
         continue;
       }
       throw err;
@@ -274,10 +359,10 @@ export class Client {
   }
 
   /** @internal */
-  async json<T = any>(method: string, path: string, payload?: unknown, opts: { query?: RequestInit2['query']; retryPost?: boolean; signal?: AbortSignal } = {}): Promise<T> {
+  async json<T = any>(method: string, path: string, payload?: unknown, opts: { query?: RequestInit2['query']; retryPost?: boolean; signal?: AbortSignal; headers?: Record<string, string> } = {}): Promise<T> {
     const resp = await this.request({
       method, path, query: opts.query, retryPost: opts.retryPost, signal: opts.signal,
-      headers: payload === undefined ? undefined : { 'Content-Type': 'application/json' },
+      headers: payload === undefined ? opts.headers : { ...opts.headers, 'Content-Type': 'application/json' },
       body: payload === undefined ? undefined : Buffer.from(JSON.stringify(payload)),
     });
     const text = await resp.text();
@@ -319,18 +404,24 @@ export class Client {
   }
 }
 
+/** An error answer as Problem Details (RFC 9457); a HEAD answer has no body, only X-Error-Code. */
 async function readError(resp: Response): Promise<ObjectStorageError> {
   let code = resp.headers.get('x-error-code') ?? '';
   let message = resp.statusText;
+  const problem: { type?: string; instance?: string } = {};
   try {
     const doc = JSON.parse(await resp.text());
-    code = doc?.error?.code || code;
-    message = doc?.error?.message || message;
+    code = doc?.code || code;
+    message = doc?.title || message;
+    problem.type = doc?.type || undefined;
+    problem.instance = doc?.instance || undefined;
   } catch {
-    // not JSON
+    // no body, or not JSON
   }
   code ||= (resp.statusText || 'error').toLowerCase().replace(/ /g, '_');
-  return resp.status === 404 ? new NotFoundError(code, message) : new ObjectStorageError(resp.status, code, message);
+  if (resp.status === 404) return new NotFoundError(code, message, problem);
+  if (resp.status === 412) return new PreconditionFailedError(code, message, problem);
+  return new ObjectStorageError(resp.status, code, message, problem);
 }
 
 function putHeaders(key: string, o: PutOptions = {}): Record<string, string> {
@@ -339,9 +430,11 @@ function putHeaders(key: string, o: PutOptions = {}): Record<string, string> {
   if (o.contentDisposition) h['Content-Disposition'] = o.contentDisposition;
   if (o.contentEncoding) h['Content-Encoding'] = o.contentEncoding;
   for (const [k, v] of Object.entries(o.metadata ?? {})) h['X-Meta-' + k] = v;
-  if (o.ifNotExists) h['If-None-Match'] = '*';
-  return h;
+  return conditionHeaders(writeConditions(o), h);
 }
+
+/** The write conditions of upload options (ifNotExists is ifNoneMatch: '*'). */
+const writeConditions = (o: PutOptions): WriteConditions => ({ ifMatch: o.ifMatch, ifNoneMatch: o.ifNotExists ? '*' : o.ifNoneMatch });
 
 /** The objects of one bucket. */
 export class Bucket {
@@ -368,21 +461,24 @@ export class Bucket {
     return info;
   }
 
-  /** Stream an object (or a range of it). `info.size` is the whole object's size. */
+  /** Stream an object (or a range of it). `info.size` is the whole object's size. A whole-object
+   *  download with a Repr-Digest is checked as it is read: the body fails with IntegrityError at
+   *  its end if the bytes do not match. */
   async get(key: string, opts: GetOptions = {}): Promise<ObjectDownload> {
-    const headers: Record<string, string> = {};
-    if (opts.offset || opts.length) {
+    const headers = conditionHeaders(opts);
+    const ranged = !!(opts.offset || opts.length);
+    if (ranged) {
       const start = opts.offset ?? 0;
       headers.Range = opts.length ? `bytes=${start}-${start + opts.length - 1}` : `bytes=${start}-`;
     }
-    if (opts.ifNoneMatch) headers['If-None-Match'] = `"${opts.ifNoneMatch.replace(/"/g, '')}"`;
-    if (opts.ifMatch) headers['If-Match'] = `"${opts.ifMatch.replace(/"/g, '')}"`;
     const resp = await this.c.request({ method: 'GET', path: this.obj(key), headers, expect: [200, 206, 304], signal: opts.signal });
     if (resp.status === 304) {
       await resp.body?.cancel();
       throw new NotModifiedError(key);
     }
-    const body = resp.body ?? new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+    let body = resp.body ?? new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+    const want = resp.status === 200 ? expectedDigest(resp.headers) : undefined;
+    if (want) body = verifying(body, want, key);
     return {
       info: objectFromHeaders(key, resp.headers),
       contentRange: resp.headers.get('content-range') ?? undefined,
@@ -391,20 +487,26 @@ export class Bucket {
     };
   }
 
-  /** Download a whole object into memory. */
+  /** Download a whole object into memory, checked against its Repr-Digest when it has one. */
   async getBytes(key: string, signal?: AbortSignal): Promise<Uint8Array> {
     const resp = await this.c.request({ method: 'GET', path: this.obj(key), signal });
-    return new Uint8Array(await resp.arrayBuffer());
+    const data = new Uint8Array(await resp.arrayBuffer());
+    const want = expectedDigest(resp.headers);
+    if (want) checkDigest(want, createHash('sha256').update(data).digest('base64'), key);
+    return data;
   }
 
   /** Download a whole object as UTF-8 text. */
   async getText(key: string, signal?: AbortSignal): Promise<string> {
-    const resp = await this.c.request({ method: 'GET', path: this.obj(key), signal });
-    return resp.text();
+    return new TextDecoder().decode(await this.getBytes(key, signal));
   }
 
-  async head(key: string, signal?: AbortSignal): Promise<ObjectInfo> {
-    const resp = await this.c.request({ method: 'HEAD', path: this.obj(key), signal });
+  /** An object's info without its data. With `ifNoneMatch` / `ifModifiedSince` it throws
+   *  NotModifiedError when the object is unchanged. */
+  async head(key: string, opts?: AbortSignal | HeadOptions): Promise<ObjectInfo> {
+    const o = optionsOf(opts);
+    const resp = await this.c.request({ method: 'HEAD', path: this.obj(key), headers: conditionHeaders(o), expect: [200, 304], signal: o.signal });
+    if (resp.status === 304) throw new NotModifiedError(key);
     return objectFromHeaders(key, resp.headers);
   }
 
@@ -418,9 +520,10 @@ export class Bucket {
     }
   }
 
-  /** Delete an object; deleting a missing one succeeds. */
-  async delete(key: string, signal?: AbortSignal): Promise<void> {
-    const resp = await this.c.request({ method: 'DELETE', path: this.obj(key), signal });
+  /** Delete an object; deleting a missing one succeeds (unless `ifMatch` wanted one). */
+  async delete(key: string, opts?: AbortSignal | DeleteOptions): Promise<void> {
+    const o = optionsOf(opts);
+    const resp = await this.c.request({ method: 'DELETE', path: this.obj(key), headers: conditionHeaders(o), signal: o.signal });
     await resp.body?.cancel();
   }
 
@@ -495,7 +598,8 @@ export class Bucket {
   }
 
   /** Upload a local file. Large files go up as parts read from the file and
-   *  sent in parallel; a part is re-read if it must be sent again. */
+   *  sent in parallel; a part is re-read if it must be sent again. `ifMatch` /
+   *  `ifNoneMatch` are checked when the parts are joined. */
   async uploadFile(key: string, path: string, opts: PutOptions = {}): Promise<ObjectInfo> {
     const { size } = await stat(path);
     const options = { ...opts, contentType: opts.contentType || guessType(path) };
@@ -517,7 +621,7 @@ export class Bucket {
           await readFully(fh, buf, i * ps);
           parts[i] = await up.uploadPart(i + 1, buf, opts.signal);
         });
-        return await up.complete(parts, opts.signal);
+        return await up.complete(parts, { ...writeConditions(opts), signal: opts.signal });
       } catch (e) {
         await up.abortQuietly();
         throw e;
@@ -529,7 +633,8 @@ export class Bucket {
 
   /** Upload what a stream yields (a pipe, an HTTP request, a generated
    *  export) without knowing its size. Parts are sent in parallel, holding at
-   *  most `concurrency + 1` in memory. */
+   *  most `concurrency + 1` in memory; every part (or a small stream, sent in
+   *  one request) is buffered, so its Content-Digest is known before it is sent. */
   async upload(key: string, source: AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>, opts: PutOptions = {}): Promise<ObjectInfo> {
     const ps = this.c.partSize;
     const chunks = partChunks(source, ps);
@@ -560,7 +665,7 @@ export class Bucket {
       }
       await Promise.all(inflight);
       if (failed !== undefined) throw failed;
-      return await up.complete(parts, opts.signal);
+      return await up.complete(parts, { ...writeConditions(opts), signal: opts.signal });
     } catch (e) {
       await Promise.allSettled(inflight);
       await up.abortQuietly();
@@ -570,12 +675,13 @@ export class Bucket {
 
   /** Save an object to `path`. Large objects come down as parallel ranges
    *  pinned to the object's ETag, written straight to their place in the
-   *  file; the data goes to `path + '.download'` and is renamed into place. */
+   *  file; the data goes to `path + '.download'` and is renamed into place
+   *  only once it matches the object's Repr-Digest (when it has one). */
   async downloadFile(key: string, path: string, signal?: AbortSignal): Promise<ObjectInfo> {
     const info = await this.head(key, signal);
     await mkdir(dirname(path), { recursive: true });
     const tmp = path + '.download';
-    const fh = await open(tmp, 'w');
+    const fh = await open(tmp, 'w+'); // read back to check a ranged download's digest
     try {
       await fh.truncate(info.size);
       if (info.size <= this.c.multipartThreshold) {
@@ -593,6 +699,9 @@ export class Bucket {
         const ps = this.c.partSize;
         await parallel(this.c.concurrency, Math.ceil(info.size / ps), (i) =>
           this.downloadRange(key, info.etag, fh, i * ps, Math.min(ps, info.size - i * ps), signal));
+        // The ranges arrived out of order: hash the whole file once they are all in.
+        const want = sha256FromField(info.digest);
+        if (want) checkDigest(want, await hashFile(fh, info.size), key);
       }
       await fh.close();
       await rename(tmp, path);
@@ -657,14 +766,16 @@ export class MultipartUpload {
     return (d.parts ?? []).map((p: any) => ({ number: p.number, etag: p.etag, size: p.size }));
   }
 
-  /** Join the parts into the object; without `parts`, every part received, in order. */
-  async complete(parts?: Part[], signal?: AbortSignal): Promise<ObjectInfo> {
+  /** Join the parts into the object; without `parts`, every part received, in order.
+   *  `ifMatch` / `ifNoneMatch` are checked against the key atomically with the join. */
+  async complete(parts?: Part[], opts?: AbortSignal | CompleteOptions): Promise<ObjectInfo> {
+    const o = optionsOf(opts);
     const payload = parts ? { parts: [...parts].sort((a, b) => a.number - b.number).map((p) => ({ number: p.number, etag: p.etag })) } : undefined;
     try {
-      return objectFromJSON(await this.bucket.c.json('POST', this.path + '/complete', payload, { retryPost: true, signal }));
+      return objectFromJSON(await this.bucket.c.json('POST', this.path + '/complete', payload, { retryPost: true, signal: o.signal, headers: conditionHeaders(o) }));
     } catch (e) {
       // A retry after a completion whose answer was lost.
-      if (e instanceof NotFoundError) return this.bucket.head(this.key, signal);
+      if (e instanceof NotFoundError) return this.bucket.head(this.key, o.signal);
       throw e;
     }
   }
@@ -690,6 +801,19 @@ async function readFully(fh: FileHandle, buf: Buffer, position: number) {
     if (bytesRead === 0) throw new Error('file shrank while it was being uploaded');
     off += bytesRead;
   }
+}
+
+/** The base64 SHA-256 of the first `size` bytes of a file. */
+async function hashFile(fh: FileHandle, size: number): Promise<string> {
+  const hash = createHash('sha256');
+  const buf = Buffer.allocUnsafe(Math.min(size, 4 * MiB));
+  for (let pos = 0; pos < size;) {
+    const { bytesRead } = await fh.read(buf, 0, Math.min(buf.length, size - pos), pos);
+    if (bytesRead === 0) break;
+    hash.update(buf.subarray(0, bytesRead));
+    pos += bytesRead;
+  }
+  return hash.digest('base64');
 }
 
 async function writeFully(fh: FileHandle, data: Uint8Array, position: number) {
