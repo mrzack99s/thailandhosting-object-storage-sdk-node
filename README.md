@@ -16,7 +16,7 @@ Node's built-in `fetch` (keep-alive connection pooling) and streams.
 import { Client, NotFoundError } from '@thailandhosting/object-storage';
 
 const client = new Client({
-  endpoint: 'https://objects.bkk.thailandhosting.com',
+  endpoint: 'https://objects.thailandhosting.com/th-bkk-1',
   accessKeyId: process.env.TH_ACCESS_KEY_ID!,
   secretAccessKey: process.env.TH_SECRET_ACCESS_KEY!,
 });
@@ -101,10 +101,10 @@ failed condition is `PreconditionFailedError` (HTTP 412) and is never retried.
 // allowed to manage buckets. [] makes the bucket private again.
 await bucket.setPublicAccess([{ prefix: 'images/' }]);
 console.log(bucket.publicUrl('images/logo.png'));
-// https://objects.bkk.thailandhosting.com/my-bucket/images/logo.png
+// https://objects.thailandhosting.com/th-bkk-1/my-bucket/images/logo.png
 
 // A client without a key reads (and, where allowed, lists) public objects.
-const anon = new Client({ endpoint: 'https://objects.bkk.thailandhosting.com' });
+const anon = new Client({ endpoint: 'https://objects.thailandhosting.com/th-bkk-1' });
 const logo = await anon.bucket('my-bucket').getBytes('images/logo.png');
 ```
 

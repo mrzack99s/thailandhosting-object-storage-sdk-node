@@ -13,6 +13,7 @@
   },
   "files": ["dist", "README.md"],
   "engines": { "node": ">=18.17" },
+  "repository": { "type": "git", "url": "git+https://github.com/mrzack99s/thailandhosting-object-storage-sdk-node.git" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -21,6 +22,7 @@
   },
   "keywords": ["thailandhosting", "object-storage", "storage", "s3"],
   "license": "MIT",
+  "publishConfig": { "access": "public" },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "typescript": "^5.8.0"
