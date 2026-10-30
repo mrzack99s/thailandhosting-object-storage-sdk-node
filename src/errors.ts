@@ -18,6 +18,14 @@ export class ObjectStorageError extends Error {
   }
 }
 
+/** The `tokenProvider` failed or gave no token: nothing was sent. The provider's error is in `cause`. Not retried. */
+export class TokenError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = 'TokenError';
+  }
+}
+
 /** The bucket, object or upload does not exist. */
 export class NotFoundError extends ObjectStorageError {
   constructor(code: string, message: string, problem?: { type?: string; instance?: string }) {

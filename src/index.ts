@@ -18,6 +18,6 @@ export type {
   BucketInfo, ClientOptions, CompleteOptions, DeleteOptions, GetOptions, HeadOptions, Link, ListOptions, ListPage, ObjectDownload, ObjectInfo, Part,
   PublicRule, PutOptions, WriteConditions,
 } from './client.ts';
-export { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError } from './errors.ts';
+export { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError, TokenError } from './errors.ts';
 export { contentDigest, signRequest } from './signing.ts';
 export type { SignInput } from './signing.ts';

@@ -68,6 +68,31 @@ service's. A client without a key sends no signature.
 `signRequest` and `contentDigest` are exported for signing requests made
 with your own HTTP client.
 
+## Using a service account
+
+A program can use a service account's short-lived token instead of an access
+key. Get it with the identity SDK and pass `tokenProvider` in place of the key:
+
+```ts
+import { defaultCredential } from '@thailandhosting/identity';
+
+const cred = defaultCredential();
+const client = new Client({
+  endpoint: 'https://objects.thailandhosting.com/th-bkk-1',
+  tokenProvider: () => cred.getToken(),
+});
+```
+
+The account needs a grant on the bucket, set in the Console. Creating and
+deleting buckets and changing public access take an access key allowed to
+manage buckets.
+
+`tokenProvider` is called before every attempt, so a refreshed token is picked
+up. Give a key or a token provider, not both. If it fails, nothing is sent or
+retried: the call rejects with `TokenError`. Large uploads and downloads work
+as with a key. `createLink` needs an access key, because a link is signed with
+the key's secret, and rejects with a token. `publicUrl` works.
+
 ## Conditional writes
 
 ```ts

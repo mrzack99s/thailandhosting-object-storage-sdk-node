@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { open, mkdir, rename, rm, stat, type FileHandle } from 'node:fs/promises';
 import { dirname, extname } from 'node:path';
 import { Readable } from 'node:stream';
-import { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError } from './errors.ts';
+import { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError, TokenError } from './errors.ts';
 import { contentDigest, sha256FromField, signRequest } from './signing.ts';
 
 export const VERSION = '1.0.0';
@@ -19,6 +19,10 @@ export interface ClientOptions {
    *  Requests are signed with the secret (HTTP Message Signatures); the secret itself is never sent. */
   accessKeyId?: string;
   secretAccessKey?: string;
+  /** Instead of a key: gives a service account's short-lived token, sent as `Authorization: Bearer` with no
+   *  signature. Called before every attempt, retries included, so it should cache and refresh the token.
+   *  `createLink` needs an access key. */
+  tokenProvider?: () => Promise<string> | string;
   /** Size of each upload part and download range (default 16 MiB, at least 5 MiB). */
   partSize?: number;
   /** Size above which transfers are split (default 2 × partSize). */
@@ -266,6 +270,18 @@ function objectFromHeaders(key: string, h: Headers): ObjectInfo {
   };
 }
 
+/** The Authorization value from a token provider; its failure is a TokenError. */
+async function bearer(provider: () => Promise<string> | string): Promise<string> {
+  let token: string;
+  try {
+    token = await provider();
+  } catch (err) {
+    throw new TokenError(`tokenProvider failed: ${err instanceof Error ? err.message : err}`, err);
+  }
+  if (!token || typeof token !== 'string') throw new TokenError('tokenProvider gave no token');
+  return 'Bearer ' + token;
+}
+
 /** Runs task(0..n-1), `workers` at a time; the first failure stops new work and is thrown. */
 async function parallel(workers: number, n: number, task: (i: number) => Promise<void>): Promise<void> {
   let next = 0;
@@ -294,6 +310,7 @@ export class Client {
   /** @internal */ readonly origin: string;
   private readonly keyId: string;
   private readonly secret: string;
+  /** @internal */ readonly tokenProvider?: () => Promise<string> | string;
   private readonly ua: string;
   private readonly fetch: typeof fetch;
 
@@ -301,6 +318,7 @@ export class Client {
     if (!opts.endpoint || !opts.accessKeyId !== !opts.secretAccessKey) {
       throw new Error('endpoint is required, and accessKeyId and secretAccessKey together');
     }
+    if (opts.tokenProvider && opts.accessKeyId) throw new Error('give an access key or tokenProvider, not both');
     const u = new URL(opts.endpoint);
     if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error(`invalid endpoint ${opts.endpoint}`);
     const path = u.pathname.replace(/\/+$/, '').replace(/\/v1$/, '');
@@ -308,6 +326,7 @@ export class Client {
     this.base = `${this.origin}/v1`;
     this.keyId = opts.accessKeyId ?? '';
     this.secret = opts.secretAccessKey ?? '';
+    this.tokenProvider = opts.tokenProvider;
     this.partSize = Math.max(opts.partSize ?? 16 * MiB, MIN_PART_SIZE);
     this.multipartThreshold = opts.multipartThreshold ?? 2 * this.partSize;
     this.concurrency = Math.max(1, opts.concurrency ?? 8);
@@ -329,7 +348,10 @@ export class Client {
     // Every body carries its digest; the service checks it as the bytes arrive.
     if (r.body) headers['Content-Digest'] = contentDigest(r.body);
     for (let attempt = 0; ; attempt++) {
-      if (this.keyId) {
+      if (this.tokenProvider) {
+        // Asked for on every attempt: a retry picks up a refreshed token.
+        headers.Authorization = await bearer(this.tokenProvider);
+      } else if (this.keyId) {
         // A fresh signature each attempt: created must be close to the service's clock.
         Object.assign(headers, signRequest({ method: r.method, url, accessKeyId: this.keyId, secretAccessKey: this.secret, contentDigest: headers['Content-Digest'] }));
       }
@@ -557,8 +579,9 @@ export class Bucket {
     } while (cursor);
   }
 
-  /** A URL that downloads (or, with `upload: true`, uploads) one object without a key. */
+  /** A URL that downloads (or, with `upload: true`, uploads) one object without a key. Needs a client with an access key. */
   async createLink(key: string, opts: { expiresIn?: number; upload?: boolean; signal?: AbortSignal } = {}): Promise<Link> {
+    if (this.c.tokenProvider) throw new Error("createLink needs an access key: a link is signed with the key's secret, and a service account has none");
     const d = await this.c.json('POST', this.path + '/links', { key, expiresIn: opts.expiresIn ?? 3600, method: opts.upload ? 'PUT' : 'GET' }, { retryPost: true, signal: opts.signal });
     return { url: d.url, method: d.method, expiresAt: parseDate(d.expiresAt) };
   }
@@ -723,7 +746,7 @@ export class Bucket {
           done += chunk.length;
         }
       } catch (e) {
-        if (e instanceof ObjectStorageError || signal?.aborted || attempt >= this.c.maxRetries) throw e;
+        if (e instanceof ObjectStorageError || e instanceof TokenError || signal?.aborted || attempt >= this.c.maxRetries) throw e;
       }
       if (done < length) {
         // The connection broke mid-range: carry on from where it stopped.

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import {
-  Client, IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError, contentDigest, signRequest,
+  Client, IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError, TokenError, contentDigest, signRequest,
 } from '../src/index.ts';
 import { signatureBase, signatureParams } from '../src/signing.ts';
 
@@ -32,6 +32,7 @@ class Fake {
   requests = 0;
   headerValues: string[] = []; // every request header value seen
   signatures: string[] = [];
+  authorizations: (string | undefined)[] = []; // of every request
   bodyDigests: { method: string; path: string; digest?: string }[] = [];
   public = new Map<string, { prefix: string; list?: boolean }[]>(); // bucket: what anyone may read
 }
@@ -123,7 +124,10 @@ function startFake(fake: Fake): Promise<{ server: Server; url: string }> {
     for (const v of Object.values(req.headers)) fake.headerValues.push(String(v));
     let body = await readBody(req);
     if (fake.tamper && body.length) body = Buffer.concat([Buffer.from([body[0]! ^ 1]), body.subarray(1)]);
-    if (req.headers['signature-input']) {
+    fake.authorizations.push(req.headers.authorization);
+    if (req.headers.authorization?.startsWith('Bearer tok-')) {
+      // A service account's token.
+    } else if (req.headers['signature-input']) {
       fake.signatures.push(String(req.headers.signature));
       if (checkSignature(req, body)) return fail(req, res, 401, 'invalid_signature');
     } else if (!publicRead(fake, req)) {
@@ -523,6 +527,84 @@ describe('against a fake service', () => {
     const got = Buffer.from(await new Response(dl.body).arrayBuffer());
     assert.deepEqual([...got], [10, 11, 12, 13, 14]);
     assert.equal(dl.info.size, 100);
+  });
+});
+
+describe('with a token provider', () => {
+  let fake: Fake;
+  let server: Server;
+  let url: string;
+  let dir: string;
+  before(async () => {
+    fake = new Fake();
+    const s = await startFake(fake);
+    server = s.server;
+    url = s.url;
+    dir = await mkdtemp(join(tmpdir(), 'th-sdk-'));
+  });
+  after(async () => {
+    server.closeAllConnections();
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test('a fresh token on every attempt and no signature, through large transfers', async () => {
+    let calls = 0;
+    const c = new Client({ endpoint: url, tokenProvider: async () => `tok-${++calls}`, partSize: 5 * MiB, concurrency: 4 });
+    const b = c.bucket('t');
+    const seen = fake.authorizations.length;
+    fake.flaky = 1;
+    await b.put('small', 'data');
+    assert.deepEqual(fake.authorizations.slice(seen), ['Bearer tok-1', 'Bearer tok-2']);
+
+    const data = randomBytes(12 * MiB);
+    const before = fake.bodyDigests.length;
+    await b.upload('big', (async function* () { yield data; })());
+    assert.equal(fake.bodyDigests.slice(before).filter((d) => d.path.includes('/parts/')).length, 3);
+    const path = join(dir, 'big');
+    await b.downloadFile('big', path);
+    assert.ok(Buffer.from(await readFile(path)).equals(data));
+    assert.equal(calls, fake.authorizations.length - seen);
+    assert.equal(fake.signatures.length, 0);
+    for (const a of fake.authorizations) assert.match(String(a), /^Bearer tok-\d+$/);
+  });
+
+  test('a failing provider sends nothing and retries nothing', async () => {
+    const boom = new Error('boom');
+    let calls = 0;
+    const c = new Client({ endpoint: url, tokenProvider: () => { calls++; throw boom; } });
+    const requests = fake.requests;
+    await assert.rejects(c.bucket('t').put('k', 'data'), (e: unknown) => e instanceof TokenError && e.cause === boom);
+    assert.equal(calls, 1);
+    await assert.rejects(new Client({ endpoint: url, tokenProvider: () => '' }).listBuckets(), TokenError);
+    assert.equal(fake.requests, requests);
+  });
+
+  test('a provider failing during a parallel download is not taken for a broken connection', async () => {
+    let calls = 0;
+    const c = new Client({
+      endpoint: url, partSize: 5 * MiB, concurrency: 1,
+      tokenProvider: () => { if (++calls > 1) throw new Error('boom'); return 'tok-head'; },
+    });
+    await assert.rejects(c.bucket('t').downloadFile('big', join(dir, 'failed')), TokenError);
+    assert.equal(calls, 2);
+  });
+
+  test('createLink needs an access key', async () => {
+    const c = new Client({ endpoint: url, tokenProvider: () => 'tok-1' });
+    const requests = fake.requests;
+    await assert.rejects(c.bucket('t').createLink('k'), /createLink needs an access key/);
+    assert.equal(fake.requests, requests);
+    assert.equal(c.bucket('t').publicUrl('k'), `${url}/t/k`);
+  });
+
+  // Neither is the anonymous client of public buckets, which sends no credentials.
+  test('an access key or a token provider, not both', () => {
+    const tokenProvider = () => 'tok-1';
+    assert.throws(() => new Client({ endpoint: url, accessKeyId: 'k', secretAccessKey: 's', tokenProvider }));
+    assert.throws(() => new Client({ endpoint: url, accessKeyId: 'k', tokenProvider }));
+    assert.throws(() => new Client({ endpoint: url, secretAccessKey: 's', tokenProvider }));
+    assert.ok(new Client({ endpoint: url, tokenProvider }));
   });
 });
 
