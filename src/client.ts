@@ -5,7 +5,7 @@ import { Readable } from 'node:stream';
 import { IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError, TokenError } from './errors.ts';
 import { contentDigest, sha256FromField, signRequest } from './signing.ts';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.1';
 
 const MiB = 1024 * 1024;
 const MIN_PART_SIZE = 5 * MiB;
